@@ -1,4 +1,4 @@
-import os,os.path,re,numpy,cPickle,unicodedata,sys
+import os,os.path,re,numpy,unicodedata,sys
 import numpy
 from numpy import *
 from scipy.misc import imsave
@@ -8,9 +8,20 @@ import iulib,ocropus
 import utils
 import docproc
 
+import cPickle as pickle
+pickle_mode = 2
+
 ################################################################
 ### other utilities
 ################################################################
+
+def set_params(object,kw,warn=1):
+    for k,v in kw:
+        if hasattr(object,k):
+            setattr(object,k,v)
+        else:
+            if warn:
+                warn_once("setting unknown parameter %s=%s on %s"%(k,v,object))
 
 def logging(message,*args):
     message = message%args
@@ -350,6 +361,16 @@ class CommonComponent:
         """Reinitialize the C++ component (if supported)."""
         self.comp.reinit()
 
+class PyComponent:
+    """Defines common methods similar to CommonComponent, but for Python
+    classes. Use of this base class is optional."""
+    def init(self):
+        pass
+    def name(self):
+        return "%s"%self
+    def description(self):
+        return "%s"%self
+    
 class CleanupGray(CommonComponent):
     """Cleanup grayscale images."""
     c_interface = "ICleanupGray"
@@ -699,10 +720,13 @@ class Grouper(CommonComponent):
         """Set the class for group i, and the associated cost.  The class may
         be given as an integer, as a string, or as a unicode string.  The cost
         should be non-negative."""
+        cost = float(cost)
         if type(cls)==str:
-            self.comp.setClass(i,iulib.unicode2ustrg(unicode(cls)),cost)
+            u = iulib.unicode2ustrg(unicode(cls))
+            self.comp.setClass(i,u,cost)
         elif type(cls)==unicode:
-            self.comp.setClass(i,iulib.unicode2ustrg(cls),cost)
+            u = iulib.unicode2ustrg(cls)
+            self.comp.setClass(i,u,cost)
         elif type(cls)==int:
             self.comp.setClass(i,cls,cost)
         else:
@@ -894,7 +918,14 @@ class Extractor(CommonComponent):
 class ScaledFE(Extractor):
     c_class = "scaledfe"
 
-class Classifier:
+class BboxFE(PyComponent):
+    def __init__(self,**kw):
+        self.r = 32
+        set_params(self,kw)
+    def extract(self,image):
+        return array(docproc.isotropic_rescale(image,self.r),'f')
+
+class Classifier(PyComponent):
     """An abstraction for a classifier.  This gets trained on training vectors and
     returns vectors of posterior probabilities (or some other discriminant function.)
     You usually save these objects by pickling them."""
@@ -905,23 +936,34 @@ class Classifier:
         """Compute the ouputs corresponding to each input data vector."""
         raise Exception("unimplemented")
 
-class ClassifierModel:
+class ClassifierModel(PyComponent):
     """Wraps all the necessary functionality around a classifier in order to
     turn it into a character recognition model."""
-    def __init__(self):
-        self.nbest = 10000
-        self.minp = 1e-6
+    def __init__(self,**kw):
+        self.nbest = 5
+        self.minp = 1e-3
         self.classifier = self.makeClassifier()
         self.extractor = self.makeExtractor()
+        set_params(self,kw)
         self.rows = None
         self.nrows = 0
         self.classes = []
         self.c2i = {}
         self.i2c = []
+        self.geo = None
+    def setupGeometry(self,geometry):
+        if self.geo is None:
+            if geometry is None: 
+                self.geo = 0
+            else:
+                self.geo = len(array(geometry,'f'))
     def makeInput(self,image,geometry):
-        v = self.extractor.extract(image)
-        if geometry is not None:
-            v = concatenate(v,array(geometry,'f'))
+        v = self.extractor.extract(image).ravel()
+        if self.geo>0:
+            if geometry is not None:
+                geometry = array(geometry,'f')
+                assert len(geometry)==self.geo
+                v = concatenate([v,geometry])
         return v
     def makeOutputs(self,w):
         result = []
@@ -930,7 +972,14 @@ class ClassifierModel:
             if w[i]<self.minp: break
             result.append((self.i2c[i],w[i]))
         return result
+    def clear(self):
+        self.rows = None
+        self.classes = None
+        self.nrows = 0
     def cadd(self,image,c,geometry=None):
+        if self.geo is None: 
+            # first time around, remember whether this classifier uses geometry
+            self.setupGeometry(geometry)
         v = self.makeInput(image,geometry)
         assert amin(v)>=-1.2 and amax(v)<=1.2
         if self.nrows==0:
@@ -948,6 +997,17 @@ class ClassifierModel:
         n,d = self.rows.shape
         self.rows.resize(self.nrows,d)
         self.classifier.train(self.rows,array(self.classes,'i'),*args,**kw)
+        self.clear()
+    def updateModel1(self,*args,**kw):
+        if not hasattr(self.classifier,"train1"):
+            warn_once("no train1 method; just doing training in one step")
+            self.updateModel(*args,**kw)
+            return
+        n,d = self.rows.shape
+        self.rows.resize(self.nrows,d)
+        for progress in self.classifier.train1(self.rows,array(self.classes,'i'),*args,**kw):
+            yield progress
+        self.clear()
     def coutputs(self,image,geometry=None):
         v = self.makeInput(image,geometry)
         w = self.classifier.outputs(v.reshape(1,len(v)))[0]
@@ -960,6 +1020,18 @@ class ClassifierModel:
         # FIXME parallelize this
         if geometries is None: geometries = [None]*len(images)
         return [self.coutputs(images[i],geometries[i]) for i in range(len(images))]
+    def save_component(self,path):
+        rows = self.rows
+        nrows = self.nrows
+        classes = self.classes
+        self.rows = None
+        self.classes = None
+        self.nrows = None
+        with open(path,"wb") as stream:
+            pickle.dump(self,stream,pickle_mode)
+        self.rows = rows
+        self.classes = classes
+        self.nrows = nrows
 
 class DistComp(CommonComponent):
     """Compute distances fast. (Only for backwards compatibility; not recommended.)"""
@@ -1462,14 +1534,35 @@ def make_IModel(name):
 def make_IExtractor(name):
     return mkpython(name) or Extractor().make(name)
 
-def save_component(file,object):
+def obinfo(ob):
+    result = str(ob)
+    if hasattr(ob,"shape"): 
+        result += " "
+        result += str(ob.shape)
+    return result
+
+def save_component(file,object,verbose=0,verify=0):
+    if hasattr(object,"save_component"):
+        object.save_component(file)
+        return
     if isinstance(object,CommonComponent) and hasattr(object,"comp"):
-        ocropus.save_component(object.comp)
+        ocropus.save_component(file,object.comp)
         return
     if type(object).__module__=="ocropus":
-        ocropus.save_component(object)
-    with open(file,"w") as stream:
-        cPickle.dump(object,stream,2)
+        ocropus.save_component(file,object)
+        return
+    if verbose: 
+        print "[save_component]"
+    if verbose:
+        for k,v in object.__dict__.items():
+            print ":",k,obinfo(v)
+    with open(file,"wb") as stream:
+        pickle.dump(object,stream,pickle_mode)
+    if verify:
+        if verbose: 
+            print "[trying to read it again]"
+        with open(file,"rb") as stream:
+            test = pickle.load(stream)
 
 def load_component(file):
     if file[0]=="=":
@@ -1486,8 +1579,8 @@ def load_component(file):
         result = Model()
         result.comp = ocropus.load_IModel(file)
         return result
-    with open(file,"r") as stream:
-        return cPickle.load(stream)
+    with open(file,"rb") as stream:
+        return pickle.load(stream)
 
 def load_linerec(file,wrapper=CmodelLineRecognizer):
     """Loads a line recognizer.  This handles a bunch of special cases
@@ -1506,7 +1599,7 @@ def load_linerec(file,wrapper=CmodelLineRecognizer):
 
     if ".pymodel" in file:
         with open(file,"rb") as stream:
-            result = cPickle.load(stream)
+            result = pickle.load(stream)
         if getattr(result,"coutputs",None):
             print "[wrapping %s]"%result
             result = wrapper(cmodel=result)

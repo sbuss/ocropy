@@ -1,3 +1,4 @@
+import scipy
 from scipy import stats
 from scipy.ndimage import measurements
 
@@ -58,6 +59,8 @@ def rel_char_geom(box,params):
     return rel_ypos,rel_width,rel_height
 
 def rel_geo_normalize(rel):
+    """Given a set of geometric parameters, normalize them into the
+    range -1...1 so that they can be used as input to a neural network."""
     if type(rel)==str:
         rel = [float(x) for x in rel.split()]
     ry,rw,rh = rel
@@ -67,3 +70,33 @@ def rel_geo_normalize(rel):
     geometry = array([ry,rw,rh],'f')
     return geometry
 
+def bbox(image):
+    """Compute the bounding box for the pixels in the image."""
+    image = (image!=0)
+    c = scipy.ndimage.measurements.find_objects(image)[0]
+    return (c[0].start,c[1].start,c[0].stop,c[1].stop)
+
+def extract(image,x0,y0,x1,y1):
+    """Extract a subregion of the given image.  The limits do not have to
+    be within the image."""
+    return scipy.ndimage.interpolation.affine_transform(image,diag([1,1]),
+                                                        offset=(x0,y0),
+                                                        output_shape=(x1-x0,y1-y0))
+
+def isotropic_rescale(image,r=32):
+    """Rescale the image such that the non-zero pixels fall within a box of size
+    r x r.  Rescaling is isotropic."""
+    x0,y0,x1,y1 = bbox(image)
+    sx = r*1.0/(x1-x0)
+    sy = r*1.0/(y1-y0)
+    s = min(sx,sy)
+    s = min(s,1.0)
+    rs = r/s
+    dx = x0-(rs-(x1-x0))/2
+    dy = y0-(rs-(y1-y0))/2
+    result = scipy.ndimage.affine_transform(image,
+                                            diag([1/s,1/s]),
+                                            offset=(dx,dy),
+                                            order=0,
+                                            output_shape=(r,r))
+    return result

@@ -9,10 +9,17 @@ from random import sample as selection, shuffle, uniform
 from numpy import *
 from pylab import *
 from scipy import *
+import utils
 
 import common
 ocrolib = common
 from native import *
+
+class Record:
+    def __init__(self, **kwds):
+        self.__dict__.update(kwds)
+    def __str__(self):
+        return str(self.__dict__)
 
 def c_order(a):
     return tuple(a.strides)==tuple(sorted(a.strides,reverse=1))
@@ -37,11 +44,14 @@ nnet_native = compile_and_load(r'''
 #include <stdio.h>
 #include <assert.h>
 #include <stdlib.h>
+#include <omp.h>
 
 int verbose = 0;
+int maxthreads = 4;
 
 double sigmoid(double x);
 double max(double x,double y);
+#define MIN(x,y) ((x)<(y)?(x):(y))
 
 inline double sigmoid(double x) {
     if(x<-200) x = -200;
@@ -113,7 +123,7 @@ void backward(int n,int m,int l,float w1[m][n],float b1[m],float w2[l][m],float 
     if(verbose) printf("backward %d:%d:%d (%d)\n",n,m,l,k);
     assert(eta>0.0);
     assert(eta<10.0);
-#pragma omp parallel for
+#pragma omp parallel for num_threads (maxthreads)
     for(int trial=0;trial<ntrain;trial++) {
         int row;
         if(nsamples>0) row = samples[(unsigned)(19.73*k*sin(trial))%nsamples];
@@ -210,7 +220,7 @@ void backward_b(int n,int m,int l,float w1[m][n],float b1[m],float w2[l][m],floa
     if(verbose) printf("backward %d:%d:%d (%d)\n",n,m,l,k);
     assert(eta>0.0);
     assert(eta<10.0);
-#pragma omp parallel for
+#pragma omp parallel for num_threads (maxthreads)
     for(int trial=0;trial<ntrain;trial++) {
         int row;
         if(nsamples>0) row = samples[(unsigned)(19.73*k*sin(trial))%nsamples];
@@ -264,12 +274,16 @@ nnet_native.forward_b.argtypes = [I,I,I,A2F,A1F,A2F,A1F, I,A2B,A2F]
 nnet_native.classify_b.argtypes = [I,I,I,A2F,A1F,A2F,A1F, I,A2B,A1I]
 nnet_native.backward_b.argtypes = [I,I,I,A2F,A1F,A2F,A1F, I,A2B,A1I,F,I,I,A1I]
 
+nverbose = c_int.in_dll(nnet_native,"verbose")
+maxthreads = c_int.in_dll(nnet_native,"maxthreads")
+maxthreads.value = min(8,utils.number_of_processors())
 
 class MLP:
-    def __init__(self):
+    def __init__(self,**kw):
         self.w1 = None
         self.verbose = 0
         self.eta = 0.1
+        common.set_params(self,kw,warn=0)
         self.err = -1
     def copy(self):
         mlp = MLP()
@@ -397,7 +411,7 @@ class MLP:
             nnet_native.forward_b(n,m,l,self.w1,self.b1,self.w2,self.b2,
                                   len(data),data,result)
         else:
-            raise Exception("data has unknown type")
+            raise Exception("data has unknown type: %s"%data.dtype)
         return result
     def classify(self,data,subset=None):
         data = data.reshape(len(data),prod(data.shape[1:]))
@@ -421,30 +435,33 @@ def log_uniform(lo,hi):
     return exp(pyrandom.uniform(log(lo),log(hi)))
 
 class AutoMLP(MLP):
-    def __init__(self):
+    def __init__(self,**kw):
         # fairly conservative default settings that result
         # in reasonably good performance for many problems
         self.verbose = 1
         self.initial_nhidden = [20,40,60,80,120,160]
         self.initial_eta = (0.1,0.8)
-        self.initial_epochs_per_round = 20
+        self.initial_epochs = 5
+        self.initial_ntrain = 1000000
         self.log_eta_var = 0.2
         self.log_nh_var = 0.2
         self.min_round = 100000
         self.max_round = 10000000
         self.epochs_per_round = 5
-        self.max_rounds = 24
+        self.max_rounds = 48
         self.max_pool = 3
-    def train(self,data,classes,verbose=0):
+        common.set_params(self,kw,warn=0)
+        self.kw = kw
+    def train1(self,data,classes,verbose=0):
         n = len(data)
         testing = array(selection(xrange(n),n/10),'i')
         training = setdiff1d(array(xrange(n),'i'),testing)
         testset = data[testing,:]
         testclasses = classes[testing]
-        ntrain = max(self.min_round,len(data)*self.initial_epochs_per_round)
+        ntrain = min(self.initial_epochs*n,self.initial_ntrain)
         pool = []
         for nh in self.initial_nhidden:
-            mlp = MLP()
+            mlp = MLP(**self.kw)
             mlp.eta = log_uniform(*self.initial_eta)
             mlp.train(data,classes,etas=[(mlp.eta,ntrain)],
                       nhidden=nh,
@@ -455,27 +472,37 @@ class AutoMLP(MLP):
                     mlp.err,"%.4f"%(mlp.err*1.0/len(testset))
             pool.append(mlp)
         for i in range(self.max_rounds):
+            # if the pool is too large, pick only the best models
+            errs = [x.err+0.1*x.nhidden() for x in pool]
+            if len(errs)>self.max_pool:
+                choice = argsort(errs)
+                pool = list(take(pool,choice[:self.max_pool]))
+            # pick a random model from the pool
             mlp = selection(pool,1)[0]
             mlp = mlp.copy()
+            # compute random learning rates and number of hidden units
             new_eta = exp(log(mlp.eta)+randn()*self.log_eta_var)
             new_nh = max(2,int(exp(log(mlp.nhidden())+randn()*self.log_nh_var)))
-            # print "eta",mlp.eta,new_eta,"nh",mlp.nhidden(),new_nh
+            # train with the new parameters
             mlp.eta = new_eta
             mlp.changeHidden(data,classes,new_nh)
             mlp.train(data,classes,etas=[(mlp.eta,ntrain)],
                       verbose=(self.verbose>1),samples=training)
+            # determine error on test set
             mlp.err = error(mlp,testset,testclasses)
             print "AutoMLP pool",mlp.err,"%.4f"%(mlp.err*1.0/len(testset)),\
                 "(%.3f,%d)"%(mlp.eta,mlp.nhidden()),\
                 [x.err for x in pool]
             pool += [mlp]
-            errs = [x.err+0.1*x.nhidden() for x in pool]
-            if len(errs)>self.max_pool:
-                choice = argsort(errs)
-                pool = list(take(pool,choice[:self.max_pool]))
-        best = argmin([x.err+0.1*x.nhidden() for x in pool])
-        mlp = pool[best]
-        self.assign(mlp)
+            # to allow partial training, update this with the best model so far
+            best = argmin([x.err+0.1*x.nhidden() for x in pool])
+            mlp = pool[best]
+            self.assign(mlp)
+            yield Record(round=i,rounds=self.max_rounds,testerr=mlp.err*1.0/len(testset))
+    def train(self,data,classes,verbose=1):
+        # perform training for all rounds
+        for progress in self.train1(data,classes,verbose=verbose):
+            if verbose: print "progress",progress
     def assign(self,mlp):
         for k,v in mlp.__dict__.items():
             if k[0]=="_": continue
@@ -497,7 +524,7 @@ def test():
 
 class MlpModel(common.ClassifierModel):
     makeClassifier = MLP
-    makeExtractor = ocrolib.ScaledFE
+    makeExtractor = ocrolib.BboxFE
     def __init__(self):
         common.ClassifierModel.__init__(self)
     def name(self):
@@ -507,7 +534,7 @@ class MlpModel(common.ClassifierModel):
 
 class AutoMlpModel(common.ClassifierModel):
     makeClassifier = AutoMLP
-    makeExtractor = ocrolib.ScaledFE
+    makeExtractor = ocrolib.BboxFE
     def __init__(self):
         common.ClassifierModel.__init__(self)
     def name(self):
