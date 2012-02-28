@@ -7,12 +7,12 @@
 
 import sys,os,re,codecs
 import openfst
-import ocropus,iulib
+import iulib
 import common
 import ligatures
 
 epsilon = openfst.epsilon
-sigma = ocropus.L_RHO
+sigma = -3 # FIXME
 
 Fst = openfst.StdVectorFst
 
@@ -85,7 +85,7 @@ class COST:
         assert type(start)==int and type(end)==int and hasattr(fst,'AddArc'),(start,end,fst)
         state = fst.AddState()
         self.expr.generate(fst,start,state)
-        self.AddArc(state,epsilon,epsilon,self.cost,end)
+        fst.AddArc(state,epsilon,epsilon,self.cost,end)
 
 class SEQ:
     """A sequence of FSTs.  Example: SEQ("AB","C","DEF")==STR("ABCDEF")."""
