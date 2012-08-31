@@ -16,11 +16,6 @@ from ocrolib import patrec
 from scipy.spatial import distance
 from ocrolib.patrec import Dataset,cshow,showgrid
 from ocrolib.ligatures import lig
-import cPickle
-
-def testpickle(obj):
-    with open("/dev/null","w") as stream:
-        cPickle.dump(obj,stream,2)
 
 import argparse
 parser = argparse.ArgumentParser("""
@@ -103,7 +98,7 @@ jobs = [(cluster,find(splits==cluster)) for cluster in clusters if cluster>=0]
 def process1(job):
     cluster,indexes = job
     if len(indexes)>args.maxtrain:
-        indexes = pyrandom.sample(indexes,args.trainmax)
+        indexes = pyrandom.sample(indexes,args.maxtrain)
     note = "cluster %4d len %6d"%(cluster,len(indexes))
     with tables.openFile(args.data,"r") as h5:
         # load the classes and training data
