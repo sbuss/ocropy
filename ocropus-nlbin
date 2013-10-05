@@ -64,16 +64,41 @@ def estimate_scale(binary):
     scale = median(scalemap[(scalemap>3)&(scalemap<100)])
     return scale
 
+def gradient_ascent_skew_angle(image, angles, index, step):
+    """Converge on the skew faster than calculating the mean at every angle.
+    Args:
+        angles: The list of skew angles to try, as floats
+        index: The current index into the list of angles
+        step: The number of angles to skip for the next mean calc
+    """
+    cache = {}
+    def get_var(k):
+        if k not in cache:
+            cache[k] = var(mean(interpolation.rotate(
+                image, angles[k], order=0, mode='constant'), axis=1))
+        return cache[k]
+
+    max_var = -inf
+    max_index = -inf
+    while abs(step) > 1:
+        next_var = get_var(index)
+        if next_var > max_var:
+            max_var = next_var
+            max_index = index
+        else:
+            step /= -2
+        next_index = max_index + step
+        next_index = max(0, min(next_index, len(angles)))
+        index = next_index
+    # Check 1 before and 1 after, just to be sure
+    if get_var(max_index - 1) > max_var:
+        return (get_var(max_index - 1), max_index - 1)
+    if get_var(max_index + 1) > max_var:
+        return (get_var(max_index + 1), max_index + 1)
+    return (max_var, max_index)
+
 def estimate_skew_angle(image,angles):
-    estimates = []
-    for a in angles:
-        v = mean(interpolation.rotate(image,a,order=0,mode='constant'),axis=1)
-        v = var(v)
-        estimates.append((v,a))
-    if args.debug>0:
-        plot([y for x,y in estimates],[x for x,y in estimates])
-        ginput(1,args.debug)
-    _,a = max(estimates)
+    _, a = gradient_ascent_skew_angle(image, angles, 0, len(angles) / 4)
     return a
     
 def select_regions(binary,f,min=0,nbest=100000):
